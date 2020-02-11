@@ -1,33 +1,146 @@
 //! Actix tracing - support for tokio tracing with Actix services.
-#![deny(rust_2018_idioms, warnings)]
+// #![deny(rust_2018_idioms, warnings)]
+#![deny(rust_2018_idioms)]
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use actix_service::{
     apply, dev::ApplyTransform, IntoServiceFactory, Service, ServiceFactory, Transform,
 };
-use futures_util::future::{ok, Either, Ready};
+use futures_util::future::{ok, Either, FutureExt, Map, Ready};
 use tracing_futures::{Instrument, Instrumented};
+
+struct MapConfigState<S, R> {
+    service: S,
+    data: Option<R>,
+}
+
+pub struct MapConfigService<S, R> {
+    inner: Rc<RefCell<MapConfigState<S, R>>>,
+}
+
+impl<S, R> MapConfigService<S, R> {
+    fn new(service: S, data: Option<R>) -> Self {
+        MapConfigService {
+            inner: Rc::new(RefCell::new(MapConfigState { service, data })),
+        }
+    }
+}
+
+impl<S, R> Clone for MapConfigService<S, R> {
+    fn clone(&self) -> Self {
+        MapConfigService {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<S, R> Service for MapConfigService<S, R>
+where
+    S: Service,
+{
+    type Request = S::Request;
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.borrow_mut().service.poll_ready(ctx)
+    }
+
+    fn call(&mut self, req: Self::Request) -> Self::Future {
+        self.inner.borrow_mut().service.call(req)
+    }
+}
+
+struct MapConfigFactoryState<S, M, R> {
+    service_factory: S,
+    map_cfg: M,
+    _data: PhantomData<R>,
+}
+
+pub struct MapConfigFactory<S, M, R> {
+    inner: Rc<RefCell<MapConfigFactoryState<S, M, R>>>,
+}
+
+impl<S, M, R> MapConfigFactory<S, M, R> {
+    fn new(service_factory: S, map_cfg: M) -> Self {
+        MapConfigFactory {
+            inner: Rc::new(RefCell::new(MapConfigFactoryState {
+                service_factory,
+                map_cfg,
+                _data: PhantomData,
+            })),
+        }
+    }
+}
+
+impl<S, M, R> Clone for MapConfigFactory<S, M, R> {
+    fn clone(&self) -> Self {
+        MapConfigFactory {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<S, M, R> ServiceFactory for MapConfigFactory<S, M, R>
+where
+    S: ServiceFactory,
+    M: Fn(&S::Config) -> Option<R>,
+    R: 'static,
+{
+    type Request = S::Request;
+    type Response = S::Response;
+    type Error = S::Error;
+    type Config = S::Config;
+    type Service = MapConfigService<S::Service, R>;
+    type InitError = S::InitError;
+    type Future = Map<
+        S::Future,
+        Box<
+            dyn FnOnce(
+                <S::Future as Future>::Output,
+            ) -> Result<MapConfigService<S::Service, R>, S::InitError>,
+        >,
+    >;
+
+    fn new_service(&self, cfg: Self::Config) -> Self::Future {
+        // map the config and store the transformed data
+        let data = (self.inner.borrow().map_cfg)(&cfg);
+
+        // TODO: Is there a way we can avoid the Box::new below?
+        self.inner
+            .borrow()
+            .service_factory
+            .new_service(cfg)
+            .map(Box::new(move |res| {
+                res.map(|service| MapConfigService::new(service, data))
+            }))
+    }
+}
 
 /// A `Service` implementation that automatically enters/exits tracing spans
 /// for the wrapped inner service.
 #[derive(Clone)]
-pub struct TracingService<S, F> {
-    inner: S,
+pub struct TracingService<S, R, F> {
+    inner: MapConfigService<S, R>,
     make_span: F,
 }
 
-impl<S, F> TracingService<S, F> {
-    pub fn new(inner: S, make_span: F) -> Self {
+impl<S, R, F> TracingService<S, R, F> {
+    pub fn new(inner: MapConfigService<S, R>, make_span: F) -> Self {
         TracingService { inner, make_span }
     }
 }
 
-impl<S, F> Service for TracingService<S, F>
+impl<S, R, F> Service for TracingService<S, R, F>
 where
     S: Service,
-    F: Fn(&S::Request) -> Option<tracing::Span>,
+    F: Fn(Option<&R>, &S::Request) -> Option<tracing::Span>,
 {
     type Request = S::Request;
     type Response = S::Response;
@@ -39,7 +152,7 @@ where
     }
 
     fn call(&mut self, req: Self::Request) -> Self::Future {
-        let span = (self.make_span)(&req);
+        let span = (self.make_span)(self.inner.inner.borrow().data.as_ref(), &req);
         let _enter = span.as_ref().map(|s| s.enter());
 
         let fut = self.inner.call(req);
@@ -59,12 +172,12 @@ where
 /// A `Transform` implementation that wraps services with a [`TracingService`].
 ///
 /// [`TracingService`]: struct.TracingService.html
-pub struct TracingTransform<S, U, F> {
+pub struct TracingTransform<S, U, F, R> {
     make_span: F,
-    _p: PhantomData<fn(S, U)>,
+    _p: PhantomData<fn(S, U, R)>,
 }
 
-impl<S, U, F> TracingTransform<S, U, F> {
+impl<S, U, F, R> TracingTransform<S, U, F, R> {
     pub fn new(make_span: F) -> Self {
         TracingTransform {
             make_span,
@@ -73,7 +186,7 @@ impl<S, U, F> TracingTransform<S, U, F> {
     }
 }
 
-impl<S, U, F> Transform<S> for TracingTransform<S, U, F>
+impl<S, U, F, R> Transform<MapConfigService<S, R>> for TracingTransform<S, U, F, R>
 where
     S: Service,
     U: ServiceFactory<
@@ -82,16 +195,16 @@ where
         Error = S::Error,
         Service = S,
     >,
-    F: Fn(&S::Request) -> Option<tracing::Span> + Clone,
+    F: Fn(Option<&R>, &S::Request) -> Option<tracing::Span> + Clone,
 {
     type Request = S::Request;
     type Response = S::Response;
     type Error = S::Error;
-    type Transform = TracingService<S, F>;
+    type Transform = TracingService<S, R, F>;
     type InitError = U::InitError;
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
-    fn new_transform(&self, service: S) -> Self::Future {
+    fn new_transform(&self, service: MapConfigService<S, R>) -> Self::Future {
         ok(TracingService::new(service, self.make_span.clone()))
     }
 }
@@ -109,19 +222,23 @@ where
 ///     |req: &Request| Some(span!(Level::INFO, "request", req.id))
 /// );
 /// ```
-pub fn trace<S, U, F>(
+pub fn trace<S, U, M, R, F>(
     service_factory: U,
+    map_cfg: M,
     make_span: F,
-) -> ApplyTransform<TracingTransform<S::Service, S, F>, S>
+) -> ApplyTransform<
+    TracingTransform<MapConfigService<S::Service, R>, S, F, R>,
+    MapConfigService<S::Service, R>,
+>
 where
     S: ServiceFactory,
-    F: Fn(&S::Request) -> Option<tracing::Span> + Clone,
     U: IntoServiceFactory<S>,
+    M: Fn(&S::Config) -> Option<R>,
+    F: Fn(Option<&R>, &S::Request) -> Option<tracing::Span> + Clone,
 {
-    apply(
-        TracingTransform::new(make_span),
-        service_factory.into_factory(),
-    )
+    let service_factory = MapConfigFactory::new(service_factory.into_factory(), map_cfg);
+
+    apply(TracingTransform::new(make_span), service_factory)
 }
 
 #[cfg(test)]
